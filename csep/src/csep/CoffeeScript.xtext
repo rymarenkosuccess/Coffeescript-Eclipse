@@ -1,0 +1,417 @@
+grammar csep.CoffeeScript hidden(WS, ML_COMMENT, SL_COMMENT)
+import "http://www.eclipse.org/emf/2002/Ecore" as ecore
+
+generate coffeeScript "http://www.coffeescript.org/eclipse"
+
+Root:
+	(Body | Block TERMINATOR)?;
+
+Body:
+	lines+=Line (TERMINATOR lines+=Line?)*;
+
+Line:
+	Stmt |
+	Expression;
+	
+Stmt:
+	ReturnStmt |
+	ThrowStmt |
+	RequireStmt |
+	Comment |
+	ClassDeclaration |
+	statement=STATEMENT;
+
+Comment:
+	comment=HERECOMMENT;
+
+/**
+ * Treat it a special way, because it takes care of import
+ */
+RequireStmt:
+  =>(importedNamespace=Id EQUAL 'require') CALL_START uri=STRING CALL_END;
+  
+ReturnStmt:
+	{ReturnStmt} RETURN expression=Expression? (POST_IF condition=Expression)?;
+	
+ThrowStmt:
+	THROW exp=Expression;
+	
+/**
+ * Coffeescript is permissive, it can be any expression, but we want to be able to check it as crossref
+ */
+SuperClass:
+	IdRef | Property;
+	
+ClassDeclaration:
+	{ClassDeclaration}
+	CLASS (
+		body=Block |
+		(EXTENDS extend=SuperClass body=Block?) |
+		(name=(Id | Property) (EXTENDS extend=SuperClass)? body=Block)
+	)?;
+
+/**
+ * FIXME: it should be the same as ClassDeclaration, but it would result in a non-LL decision,
+ * so I just removed the problematic options (a class body and a name or a superclass is required).
+ */
+AssignedClassDeclaration:
+	{ClassDeclaration}
+	CLASS (
+		(EXTENDS extend=SuperClass body=Block) |
+		(name=(Id | Property) (EXTENDS extend=SuperClass)? body=Block)
+	)?;	
+
+Expression:
+	Postfix;
+	
+// right-assoc
+// Note: the lexer seems to know it should give a POST_IF token here
+Postfix returns Expression:
+	//Assignment postfix+=(PostfixIf | ForBody)?;
+	Assignment 
+		(
+			(=>POST_IF {If.dummy=current} condition=Expression) |
+			(=>FOR {For.dummy=current} body=ForBody) |
+			(=>WHILE {While.dummy=current} body=Expression (=>WHEN when=Expression)?) |
+			(=>UNTIL {Until.dummy=current} body=Expression (=>WHEN when=Expression)?)			
+		)?;
+
+ForBody returns Expression:
+	//FIXME: Range |
+	OWN? indexes+=ForValue (COMMA indexes+=ForValue)* source=ForSource;
+
+ForValue:
+	Id;//FIXME | Array | Dictionary;
+
+ForSource:
+	{ForSource}
+	(
+		(=>FOROF source=Expression (=>WHEN when=Expression)?) |
+		(=>FORIN source=Expression (
+			(=>WHEN when=Expression (=>BY by=Expression)?) |
+			(=>BY by=Expression (=>WHEN when=Expression)?)
+			)?)
+	);
+
+Range:
+	=>(LBRACKET start=Expression (DOT_DOT | ELLIPSIS)) end=Expression RBRACKET;
+ 
+Assignment returns Expression:
+	(=>(left=Assignable operator=(EQUAL | COMPOUND_ASSIGN)) right=Assigned) |
+	LogicOp;
+
+Assigned returns Expression:
+	Expression | (INDENT Expression OUTDENT) | AssignedClassDeclaration;
+	
+LogicOp returns Expression:
+ 	CompareOp (=>({BinaryExp.left=current} operator=LOGIC) right=CompareOp)*;
+  
+CompareOp returns Expression:
+  RelationOp (=>({BinaryExp.left=current} operator=COMPARE) right=RelationOp)*;
+
+RelationOp returns Expression:
+  ShiftOp (=>({BinaryExp.left=current} operator=RELATION) right=ShiftOp)*;
+
+ShiftOp returns Expression:
+  AdditiveOp (=>({BinaryExp.left=current} operator=SHIFT) right=AdditiveOp)*;
+
+AdditiveOp returns Expression:
+  MathOp (=>({BinaryExp.left=current} operator=(PLUS | MINUS)) right=MathOp)*;
+
+MathOp returns Expression:
+  UnaryOp (=>({BinaryExp.left=current} operator=MATH) right=UnaryOp)*;
+
+UnaryOp returns Expression:
+	(UNARY | PLUS | MINUS) Expression |
+	(PLUS_PLUS | MINUS_MINUS) Variable |
+	// FIXME: postfix increment
+	Application QUESTION?;
+	
+// Nested function calls and property accesses -- I couldn't come up with a better name
+Application:
+	{SuperCall} (SUPER (CALL_START args=ArgList CALL_END)?) |
+	(value=PrimaryExpression features+=FeatureCall*);
+	
+FeatureCall:
+	FunctionCall |
+	PropertyAccess;
+	
+FunctionCall:
+	{FunctionCall} FUNC_EXIST? CALL_START args=ArgList CALL_END;
+	
+PropertyAccess:
+	NamedPropertyAccess |
+	IndexedPropertyAccess;
+
+ThisProperty:
+	AT_SIGIL Id;
+		
+NamedPropertyAccess:	
+	(accessor=(DOT | QUESTION_DOT) name=Id) |
+	(accessor=DOUBLE_COLON name=Id?);
+
+IndexedPropertyAccess:
+	INDEX_START index=Index INDEX_END;
+	
+Index:
+	(=>dots=(DOT_DOT | ELLIPSIS) end=Expression) |
+	(=>(start=Expression dots=(DOT_DOT | ELLIPSIS)) end=Expression?) |
+	exp=Expression;
+	
+// Try Range before Array
+PrimaryExpression:
+	IfExp |
+	Parenthetical |
+	Literal |
+	Range |
+	Array |
+	Dictionary |
+	Lambda |
+	ThisProperty |
+	{ThisAlone} THIS |
+	{For} (FOR loop=ForBody body=Block) |
+	{While} (WHILE loop=Expression (WHEN when=Expression)? body=Block) |
+	{Until} (UNTIL loop=Expression (WHEN when=Expression)? body=Block) |
+	{Loop} (LOOP body=Block) |
+	{TryCatch}
+	(TRY body=Block
+		(
+			(CATCH exception=Id catchBlock=Block (FINALLY finallyBlock=Block)?) |
+			(FINALLY finallyBlock=Block)
+		)?
+	) |
+	{Switch}
+	(SWITCH exp=Expression?
+		INDENT cases+=Case* (ELSE elseBlock=Block)? OUTDENT) |
+	IdRef;
+	
+Block
+  : {Block} INDENT Body? OUTDENT
+  ;
+  
+// a switch case (called When in coffeescript)
+Case:
+	LEADING_WHEN whens+=Expression (COMMA whens+=Expression)* then=Block TERMINATOR?;
+	
+IfExp
+  : blocks+=CondBlock (ELSE blocks+=CondBlock)* (ELSE defaultBlock=Block)?
+  ;
+
+// IF can be 'if' or 'unless'
+CondBlock: operator=IF condition=Expression action=Block;
+
+IdRef: val=[Id|IDENTIFIER];
+
+Id: name=IDENTIFIER;
+
+Property:
+	// FIXME: property is actually "Expression Accessor"
+	(=>(IdRef accessor=(DOT | DOUBLE_COLON | QUESTION_DOT)) prop=Id) |
+	(=>(IdRef INDEX_START) index=Index INDEX_END);
+	
+Variable:
+	Id |
+	(AT_SIGIL | (THIS DOT)) Id (DOT props+=Id)* |
+	Property;
+
+/** An array that can be on the left-hand side of an assignment */
+AssignableArray:
+	=>LBRACKET AssignableArgList RBRACKET;
+
+AssignableArgList:
+	args+=AssignableArg (COMMA args+=AssignableArg)*;
+
+AssignableArg:
+	arg=Assignable splat?=ELLIPSIS?;
+	
+Assignable:
+    Variable |
+    Dictionary |
+    AssignableArray;
+	/*
+	 * FIXME: handle more complex assignables
+	*/
+	
+Arg:
+	exp=Expression splat?=ELLIPSIS?;
+	
+ArgLine:
+	head=Arg (COMMA tail+=Arg)* COMMA?;
+	
+ExplicitArgList:
+	lines+=ArgLine ((TERMINATOR lines+=ArgLine) | (INDENT lines+=ArgLine OUTDENT))*;
+	
+ArgList:
+	{ArgList} (dummy=ExplicitArgList | (INDENT dummy=ExplicitArgList OUTDENT))?;
+	
+Array:
+	=>LBRACKET ArgList RBRACKET;
+	
+// Object in coffeescript
+Dictionary:
+	=>LCURLY DictItems RCURLY;
+	
+DictItems:
+	{DictItems} (dummy=ExplicitDictItems | (INDENT dummy=ExplicitDictItems OUTDENT))?;
+
+ExplicitDictItems:
+	lines+=DictLine ((TERMINATOR lines+=DictLine) | (INDENT lines+=DictLine OUTDENT))*;
+
+DictLine:
+	head=DictItem (COMMA tail+=DictItem)* COMMA?;
+
+DictItem:
+	{DictItem} key=DictKey (COLON (value=Expression | (INDENT value=Expression OUTDENT)))?;
+
+DictKey:
+	Literal |
+	Id;
+
+// Code in coffeescript
+Lambda:
+	(PARAM_START (params+=Param (COMMA params+=Param)*)? PARAM_END)? (FUNC_ARROW | BOUND_FUNC_ARROW) body=Block;
+	
+Param:
+	(Id | Array | Dictionary | ThisProperty) (splat?=ELLIPSIS | (EQUAL defaultValue=Expression))?;
+		
+NumberLiteral:
+	{NumberLiteral} NUMBER;
+
+StringLiteral:
+	{StringLiteral} STRING;
+
+BoolLiteral:
+	{BoolLiteral} BOOL;
+
+JSLiteral:
+	{JSLiteral} JS;
+	
+RegexLiteral:
+	{RegexLiteral} REGEX;
+	
+Literal
+  : NumberLiteral
+  | StringLiteral
+  | BoolLiteral
+  | JSLiteral
+  | RegexLiteral
+  ;
+
+Parenthetical:
+	(=>(LPAREN INDENT) content=Body OUTDENT RPAREN) |
+	=>LPAREN content=Body RPAREN;
+ 
+// terminals {{{
+/* Note: these are only to enable debugging with Antlworks,
+ * The actual tokens are provided by the lexer.
+ * The debugger is smart in some cases, and emits different tokens
+ * for the same character depending on the context.
+ * For example
+ * "(1)" -> LPAREN NUMBER RPAREN
+ * "func()" -> IDENTIFIER CALL_START CALL_END
+ * But the debugger expects different strings for the tokens,
+ * so special ones get an additional asterisk:
+ * LPAREN: '('
+ * CALL_START: '(*'
+ * 
+ * To imitate indentation while debugging, use INDENT and OUTDENT, like this
+ *   if maybe {*
+ *     action()
+ *   *}
+ *   else {*
+ *     wait()
+ *   *}
+ */
+// compound terminals at the beginning to they don't get shadowed
+terminal ELLIPSIS: '...';
+terminal DOT_DOT: '..';
+terminal DOUBLE_COLON: '::';
+terminal SHIFT: '<<' | '>>';
+terminal BOUND_FUNC_ARROW: '=>';
+terminal FUNC_ARROW: '->';
+terminal COMPARE : '<' | '==' | '>' | '<=' | '>=' | '!=';
+terminal COMPOUND_ASSIGN: '+=' | '-=';
+terminal PLUS_PLUS: '++';
+terminal MINUS_MINUS: '--';
+terminal PARAM_END: '**)';
+terminal PARAM_START: '(**';
+
+terminal AT_SIGIL: '@';
+terminal BOOL: 'true' | 'false' | 'undefined' | 'null' | 'on' | 'no' | 'yes' | 'off';
+terminal BY: 'by';
+terminal CALL_END: '*)';
+terminal CALL_START: '(*';
+terminal CATCH: 'catch';
+terminal CLASS: 'class';
+terminal COLON: ':';
+terminal COLON_SLASH: 'dummy COLON_SLASH';
+terminal COMMA: ',';
+terminal DOT: '.';
+terminal ELSE: 'else';
+terminal EQUAL: '=';
+terminal EXTENDS: 'extends';
+terminal FINALLY: 'finally';
+terminal FOR: 'for';
+terminal FORIN: 'in';
+terminal FOROF: 'of';
+terminal FUNC_EXIST: 'dummy FUNC_EXIST';
+terminal HERECOMMENT: 'dummy HERECOMMENT';
+terminal IF: 'if' | 'unless';
+terminal INDENT: '{*';
+terminal INDEX_END: '*]';
+terminal INDEX_PROTO: 'dummy INDEX_PROTO';
+terminal INDEX_SOAK: 'dummy INDEX_SOAK';
+terminal INDEX_START: '[*';
+terminal JS: 'dummy JS';
+terminal LBRACKET: '[';
+terminal LCURLY: 'dummy LCURLY';
+terminal LEADING_WHEN: 'dummy LEADING_WHEN';
+terminal LOGIC: '&&' | '||';
+terminal LOOP: 'loop';
+terminal LPAREN: '(';
+terminal MATH: '*' | '/';
+terminal MINUS: '-';
+terminal NEW: 'new';
+terminal NUMBER returns ecore::EInt: ('0'..'9')+;
+terminal OUTDENT: '*}';
+terminal OWN: 'own';
+terminal PLUS: '+';
+terminal POST_IF: 'dummy POST_IF'; // practically the same as IF
+terminal QUESTION: '?';
+terminal QUESTION_DOT: '?.';
+terminal RBRACKET: ']';
+terminal RCURLY: 'dummy RCURLY';
+terminal REGEX: '///' -> '///';
+terminal RELATION: 'in' | 'of' | 'instanceof'; 
+terminal RETURN: 'return';
+terminal RPAREN: ')';
+terminal STATEMENT: 'break' | 'continue' | 'debugger';
+terminal STRING:
+	"'''" -> "'''" |
+	"'" (!("'") ('\\' ('b'|'t'|'n'|'f'|'r'|'u'|'"'|"'"|'\\') | !('\\'|"'"))*)? "'" |
+	'"""' -> '"""' |
+	'"' (!('"') ('\\' ('b'|'t'|'n'|'f'|'r'|'u'|'"'|"'"|'\\') | !('\\'|'"'))*)? '"';
+terminal SUPER: 'super';
+terminal SWITCH: 'switch';
+terminal TERMINATOR: '\n'+;
+terminal THEN: 'then';
+terminal THIS: 'this';
+terminal THROW: 'throw';
+terminal TRY: 'try';
+terminal UNARY: '!' | '~';
+terminal UNTIL: 'until';
+terminal WHEN: 'when';
+terminal WHILE: 'while';
+
+// These tokens are used only by syntax coloring
+terminal LOGIC_WORD: 'and' | 'or';
+terminal COMPARE_WORD: 'isnt' | 'is';
+terminal UNARY_WORD: 'new' | 'do' | 'not';
+terminal ML_COMMENT	: '###' !('#') -> '###';
+terminal SL_COMMENT 	: '#' !('\n'|'\r')* ('\r'? '\n')?;
+terminal WS			: (' '|'\t')+;
+
+// Put it at the end, so keywords will be matched earlier
+terminal IDENTIFIER: '^'?('a'..'z'|'A'..'Z'|'_') ('a'..'z'|'A'..'Z'|'_'|'0'..'9')*;
+// }}} end of terminals
+// vim: set fdm=marker:
